@@ -37,8 +37,40 @@ class JsonSchemaValidator:
             return self._default_validator.evolve(schema=schema).iter_errors(data)
         return self._default_validator.iter_errors(data, schema)
 
-    def error_tree(self, errors):
-        return ErrorTree(errors=errors)
+    def strip_invalid_metadata(self, data, errors):
+        error_tree = ErrorTree(errors)
+        stripped = False
+        if "metadata" in error_tree:
+            for key in error_tree["metadata"]:
+                data["metadata"].pop(key, None)
+                stripped = True
+
+        if "cells" in error_tree:
+            number_of_cells = len(data.get("cells", 0))
+            for cell_idx in range(number_of_cells):
+                # Cells don't report individual metadata keys as having failed validation
+                # Instead it reports that it failed to validate against each cell-type definition.
+                # We have to delve into why those definitions failed to uncover which metadata
+                # keys are misbehaving.
+                if "oneOf" in error_tree["cells"][cell_idx].errors:
+                    intended_cell_type = data["cells"][cell_idx]["cell_type"]
+                    schemas_by_index = [
+                        ref["$ref"]
+                        for ref in error_tree["cells"][cell_idx].errors["oneOf"].schema["oneOf"]
+                    ]
+                    cell_type_definition_name = f"#/definitions/{intended_cell_type}_cell"
+                    if cell_type_definition_name in schemas_by_index:
+                        schema_index = schemas_by_index.index(cell_type_definition_name)
+                        for error in error_tree["cells"][cell_idx].errors["oneOf"].context:
+                            rel_path = error.relative_path
+                            error_for_intended_schema = error.schema_path[0] == schema_index
+                            is_top_level_metadata_key = (
+                                len(rel_path) == 2 and rel_path[0] == "metadata"
+                            )
+                            if error_for_intended_schema and is_top_level_metadata_key:
+                                data["cells"][cell_idx]["metadata"].pop(rel_path[1], None)
+                                stripped = True
+        return stripped
 
 
 class FastJsonSchemaValidator(JsonSchemaValidator):
@@ -67,14 +99,19 @@ class FastJsonSchemaValidator(JsonSchemaValidator):
 
         return errors
 
-    def error_tree(self, errors):
-        # fastjsonschema's exceptions don't contain the same information that the jsonschema ValidationErrors
-        # do. This method is primarily used for introspecting metadata schema failures so that we can strip
-        # them if asked to do so in `nbformat.validate`.
-        # Another way forward for compatibility: we could distill both validator errors into a custom collection
-        # for this data. Since implementation details of ValidationError is used elsewhere, we would probably
-        # just use this data for schema introspection.
-        raise NotImplementedError("JSON schema error introspection not enabled for fastjsonschema")
+    def strip_invalid_metadata(self, data, errors):
+        stripped = False
+        for error in errors:
+            section = data
+            path = error.schema_path
+            path.popleft()
+            if "metadata" in path:
+                while path[0] != "metadata":
+                    section = section[path.popleft()]
+                section = section["metadata"]
+                section.pop(path[1], None)
+                stripped = True
+        return stripped
 
 
 _VALIDATOR_MAP = [
@@ -99,5 +136,7 @@ def get_current_validator():
     """
     Return the default validator based on the value of an environment variable.
     """
-    validator_name = os.environ.get("NBFORMAT_VALIDATOR", "jsonschema")
+    default = "fastjsonschema" if fastjsonschema else "jsonschema"
+    # default = "jsonschema"
+    validator_name = os.environ.get("NBFORMAT_VALIDATOR", default)
     return _validator_for_name(validator_name)
